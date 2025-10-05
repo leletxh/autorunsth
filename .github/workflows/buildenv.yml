@@ -1,10 +1,14 @@
 name: Build Python Environment (Multi-Platform)
 
 on:
-  workflow_dispatch:  # 手动触发
+  workflow_dispatch:
+
+# 🔑 授予写权限
+permissions:
+  contents: write
 
 jobs:
-  build-env:
+  build:
     strategy:
       matrix:
         os: [ubuntu-latest, macos-latest, windows-latest]
@@ -18,8 +22,10 @@ jobs:
     runs-on: ${{ matrix.os }}
 
     steps:
-      - name: Checkout repository
+      - name: Checkout
         uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Set up Python 3.12
         uses: actions/setup-python@v5
@@ -31,60 +37,63 @@ jobs:
           curl -fsSL -o requirements.txt https://raw.githubusercontent.com/xhc2008/CABM/refs/heads/main/requirements.txt
 
       - name: Install dependencies
-        run: |
-          pip install --no-cache-dir -r requirements.txt
+        run: pip install --no-cache-dir -r requirements.txt
 
-      - name: Create env directory
-        run: |
-          mkdir -p env
-        shell: bash
-
-      - name: Remove previous env-${{ matrix.system }}.zip (if exists)
-        run: |
-          rm -f env/env-${{ matrix.system }}.zip
-        shell: bash
-
-      - name: Remove previous env-${{ matrix.system }}.zip (Windows)
-        if: matrix.os == 'windows-latest'
-        run: |
-          Remove-Item -Path "env/env-${{ matrix.system }}.zip" -ErrorAction SilentlyContinue
-        shell: pwsh
-
-      - name: Package environment into zip (Linux/macOS)
+      - name: Package environment (Unix-like)
         if: matrix.os != 'windows-latest'
         run: |
-          SITE_PACKAGES=$(python -c "import site; print(site.getsitepackages()[0])")
-          mkdir -p temp_env
-          cp -r "$SITE_PACKAGES"/* temp_env/
+          mkdir -p env
+          SITE=$(python -c "import site; print(site.getsitepackages()[0])")
+          mkdir temp_env
+          cp -r "$SITE"/* temp_env/
           cd temp_env
           zip -r "../env/env-${{ matrix.system }}.zip" .
           cd ..
           rm -rf temp_env
-        shell: bash
 
-      - name: Package environment into zip (Windows)
+      - name: Package environment (Windows)
         if: matrix.os == 'windows-latest'
         run: |
-          $sitePackages = python -c "import site; print(site.getsitepackages()[0])"
-          $tempDir = "temp_env"
-          $zipPath = "env/env-${{ matrix.system }}.zip"
+          mkdir env
+          $site = python -c "import site; print(site.getsitepackages()[0])"
+          $tmp = "temp_env"
+          New-Item -ItemType Directory -Path $tmp
+          Copy-Item -Path "$site\*" -Destination $tmp -Recurse
+          Compress-Archive -Path "$tmp\*" -DestinationPath "env/env-${{ matrix.system }}.zip"
+          Remove-Item -Recurse -Force $tmp
 
-          if (Test-Path $tempDir) { Remove-Item -Recurse -Force $tempDir }
-          New-Item -ItemType Directory -Path $tempDir
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: env-${{ matrix.system }}
+          path: env/env-${{ matrix.system }}.zip
+          retention-days: 1
 
-          Copy-Item -Path "$sitePackages\*" -Destination $tempDir -Recurse
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
 
-          if (Test-Path $zipPath) { Remove-Item $zipPath }
-          Compress-Archive -Path "$tempDir\*" -DestinationPath $zipPath
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: env
 
-          Remove-Item -Recurse -Force $tempDir
-        shell: pwsh
+      - name: Flatten and organize
+        run: |
+          mkdir -p env_final
+          find env -name "env-*.zip" -exec cp {} env_final/ \;
+          rm -rf env
+          mv env_final env
 
-      - name: Commit and push to env/
+      - name: Commit and push
         run: |
           git config --global user.name 'github-actions[bot]'
           git config --global user.email 'github-actions[bot]@users.noreply.github.com'
-          git add "env/env-${{ matrix.system }}.zip"
-          git commit -m "Update env-${{ matrix.system }}.zip with Python 3.12 dependencies"
+          git add env/
+          git commit -m "Update env-{linux,macos,windows}.zip with Python 3.12 dependencies"
           git push
-        # 注意：多个 job 并行 push 可能冲突，改用上传 artifact + 单独合并 job 更安全（见下方说明）
